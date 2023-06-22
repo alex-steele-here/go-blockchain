@@ -3,7 +3,7 @@ package main
 import (
 	"fmt"
 
-	"github.com/alex-steele/blockchain/blockchain"
+	"github.com/alex-steele-here/go-blockchain/blockchain"
 )
 
 func main() {
