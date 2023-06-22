@@ -3,7 +3,7 @@ package main
 import (
 	"fmt"
 
-	"github.com/alex-steele-here/go-blockchain/blockchain"
+	"github.com/alex-steele-here/go-blockchain.git/blockchain"
 )
 
 func main() {
@@ -13,7 +13,7 @@ func main() {
 	chain.AddBlock("Second Block after Genesis")
 	chain.AddBlock("Third Block after Genesis")
 
-	for _, block := range chain.blocks {
+	for _, block := range chain.Blocks {
 		fmt.Printf("Previous Hash: %x\n", block.PrevHash)
 		fmt.Printf("Data in Block: %s\n", block.Data)
 		fmt.Printf("Hash: %x\n", block.Hash)
