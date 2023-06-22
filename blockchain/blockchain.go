@@ -1,8 +1,12 @@
 package blockchain
 
 import (
+	"bytes"
+	"crypto/ecdsa"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"log"
 	"os"
 	"runtime"
 
@@ -94,15 +98,13 @@ func InitBlockChain(address string) *BlockChain {
 
 func (chain *BlockChain) AddBlock(transactions []*Transaction) {
 	var lastHash []byte
-	//Execute a read-only type of txn on our BadgerDB (call the database from our blockchain by calling on chain.Database)
-	//Call View (read-only), which takes in a closure with a pointer to a Badger transaction
-	//Returns an err
+	for _, tx := range transactions {
+		if chain.VerifyTransaction(tx) != true {
+			log.Panic("Invalid Transaction")
+		}
+	}
 
 	err := chain.Database.View(func(txn *badger.Txn) error {
-		//Get the current last hash out of the database (the hash of the last block in our database)
-		//Call txn.Get to get the item, then unwrap the value from item and put it into our lastHash var
-		//Return error if there is one
-		//Handle the first err if there is one
 
 		//New code from Badger DB below
 		item, err := txn.Get([]byte("lh"))
@@ -115,8 +117,7 @@ func (chain *BlockChain) AddBlock(transactions []*Transaction) {
 	Handle(err)
 
 	newBlock := CreateBlock(transactions, lastHash)
-	//With our new block now created, we want to do a read/write type txn on our db
-	//so we can put the new block into the database and assign the new block's hash to our last hash key
+
 	err = chain.Database.Update(func(txn *badger.Txn) error {
 		err := txn.Set(newBlock.Hash, newBlock.Serialize())
 		Handle(err)
@@ -127,9 +128,6 @@ func (chain *BlockChain) AddBlock(transactions []*Transaction) {
 		return err
 	})
 	Handle(err)
-	//Succesfully created a layer of persistence for our blockchain
-	//However, lost the ability to go through our blockchain and print it out like we have before
-	//All the blocks are in the data layer. Can't just print them out
 }
 
 func (chain *BlockChain) Iterator() *BlockChainIterator {
@@ -140,10 +138,6 @@ func (chain *BlockChain) Iterator() *BlockChainIterator {
 
 func (iter *BlockChainIterator) Next() *Block {
 	var block *Block
-
-	//Because we are starting with the last hash of our bc we will be iterating backwards through the blocks
-	//starting with the newest and working our way back to the genesis block
-	//Create next func for this
 
 	err := iter.Database.View(func(txn *badger.Txn) error {
 		item, err := txn.Get(iter.CurrentHash)
@@ -160,7 +154,7 @@ func (iter *BlockChainIterator) Next() *Block {
 	return block
 }
 
-func (chain *BlockChain) FindUnspentTransactions(address string) []Transaction {
+func (chain *BlockChain) FindUnspentTransactions(pubKeyHash []byte) []Transaction {
 	var unspentTxs []Transaction
 
 	spentTXOs := make(map[string][]int)
@@ -182,20 +176,19 @@ func (chain *BlockChain) FindUnspentTransactions(address string) []Transaction {
 						}
 					}
 				}
-				if out.CanBeUnlocked(address) {
+				if out.IsLockedWithKey(pubKeyHash) {
 					unspentTxs = append(unspentTxs, *tx)
 				}
 			}
 			if tx.IsCoinbase() == false {
 				for _, in := range tx.Inputs {
-					if in.CanUnlock(address) {
+					if in.UsesKey(pubKeyHash) {
 						inTxID := hex.EncodeToString(in.ID)
 						spentTXOs[inTxID] = append(spentTXOs[inTxID], in.Out)
 					}
 				}
 			}
 		}
-
 		if len(block.PrevHash) == 0 {
 			break
 		}
@@ -203,13 +196,13 @@ func (chain *BlockChain) FindUnspentTransactions(address string) []Transaction {
 	return unspentTxs
 }
 
-func (chain *BlockChain) FindUTXO(address string) []TxOutput {
+func (chain *BlockChain) FindUTXO(pubKeyHash []byte) []TxOutput {
 	var UTXOs []TxOutput
-	unspentTransactions := chain.FindUnspentTransactions(address)
+	unspentTransactions := chain.FindUnspentTransactions(pubKeyHash)
 
 	for _, tx := range unspentTransactions {
 		for _, out := range tx.Outputs {
-			if out.CanBeUnlocked(address) {
+			if out.IsLockedWithKey(pubKeyHash) {
 				UTXOs = append(UTXOs, out)
 			}
 		}
@@ -217,9 +210,9 @@ func (chain *BlockChain) FindUTXO(address string) []TxOutput {
 	return UTXOs
 }
 
-func (chain *BlockChain) FindSpendableOutputs(address string, amount int) (int, map[string][]int) {
+func (chain *BlockChain) FindSpendableOutputs(pubKeyHash []byte, amount int) (int, map[string][]int) {
 	unspentOuts := make(map[string][]int)
-	unspentTxs := chain.FindUnspentTransactions(address)
+	unspentTxs := chain.FindUnspentTransactions(pubKeyHash)
 	accumulated := 0
 
 Work:
@@ -227,7 +220,7 @@ Work:
 		txID := hex.EncodeToString(tx.ID)
 
 		for outIdx, out := range tx.Outputs {
-			if out.CanBeUnlocked(address) && accumulated < amount {
+			if out.IsLockedWithKey(pubKeyHash) && accumulated < amount {
 				accumulated += out.Value
 				unspentOuts[txID] = append(unspentOuts[txID], outIdx)
 
@@ -239,4 +232,48 @@ Work:
 	}
 
 	return accumulated, unspentOuts
+}
+
+func (bc *BlockChain) FindTransaction(ID []byte) (Transaction, error) {
+	iter := bc.Iterator()
+
+	for {
+		block := iter.Next()
+
+		for _, tx := range block.Transactions {
+			if bytes.Compare(tx.ID, ID) == 0 {
+				return *tx, nil
+			}
+		}
+
+		if len(block.PrevHash) == 0 {
+			break
+		}
+	}
+
+	return Transaction{}, errors.New("Transaction does not exist")
+}
+
+func (bc *BlockChain) SignTransaction(tx *Transaction, privKey ecdsa.PrivateKey) {
+	prevTXs := make(map[string]Transaction)
+
+	for _, in := range tx.Inputs {
+		prevTX, err := bc.FindTransaction(in.ID)
+		Handle(err)
+		prevTXs[hex.EncodeToString(prevTX.ID)] = prevTX
+	}
+
+	tx.Sign(privKey, prevTXs)
+}
+
+func (bc *BlockChain) VerifyTransaction(tx *Transaction) bool {
+	prevTXs := make(map[string]Transaction)
+
+	for _, in := range tx.Inputs {
+		prevTX, err := bc.FindTransaction(in.ID)
+		Handle(err)
+		prevTXs[hex.EncodeToString(prevTX.ID)] = prevTX
+	}
+
+	return tx.Verify(prevTXs)
 }
